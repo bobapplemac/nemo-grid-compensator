@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Nemo Grid Compensator
+Comment=Adjust desktop icon spacing after display changes
+Exec=/bin/sh -c "exec ~/.local/bin/nemo-grid-compensator --watch"
+OnlyShowIn=X-Cinnamon;
+NoDisplay=true

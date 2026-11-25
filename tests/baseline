@@ -1,0 +1,943 @@
+#!/usr/bin/python3
+"""Adjust Nemo's centered desktop grid while keeping the existing icon cells."""
+import argparse
+import configparser
+import fcntl
+import gettext
+from functools import lru_cache
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+
+import gi
+
+gi.require_version("Gdk", "3.0")
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango
+
+SETTING = "show-desktop-icons"
+CONDITION = f"GSettings org.nemo.desktop {SETTING}"
+SESSION = "org.gnome.SessionManager"
+SESSION_PATH = "/org/gnome/SessionManager"
+DESKTOP = "org.NemoDesktop"
+GROUP = "desktop-monitor-0"
+ADJUST = "desktop-grid-adjust"
+POSITION = "nemo-icon-position"
+ICONS = ("computer", "home", "trash", "network")
+METADATA = Path(GLib.get_user_config_dir()) / "nemo" / "desktop-metadata"
+STATE = Path(GLib.get_user_state_dir()) / "nemo-grid-compensator"
+
+
+class Unsupported(RuntimeError):
+    pass
+
+
+class AwaitingPlacement(Unsupported):
+    pass
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def pump():
+    context = GLib.MainContext.default()
+    while context.pending():
+        context.iteration(False)
+
+
+def wait_until(check, description):
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline:
+        pump()
+        if result := check():
+            return result
+        time.sleep(0.025)
+    raise RuntimeError(f"Timed out waiting for {description}.")
+
+
+def atomic_write(path, data, mode=0o600):
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as temp:
+        tmp = Path(temp.name)
+        try:
+            os.fchmod(temp.fileno(), mode)
+            temp.write(data)
+            temp.flush()
+            os.fsync(temp.fileno())
+            os.replace(tmp, path)
+            sync_directory(path.parent)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def read_json(path):
+    if path.is_file():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return None
+
+
+def write_json(path, value):
+    atomic_write(path, json.dumps(value, sort_keys=True).encode("utf-8"))
+
+
+def parse_metadata(data):
+    config = configparser.ConfigParser(interpolation=None, delimiters=("=",))
+    config.optionxform = str
+    config.read_string(data.decode("utf-8"))
+    return config
+
+
+def patch_metadata(data, updates):
+    """Replace only the existing keys selected by the plan."""
+    remaining = updates.copy()
+    group = None
+    lines = []
+    for line in data.decode("utf-8").splitlines(keepends=True):
+        if header := re.fullmatch(r"\s*\[(.*)\]\s*", line):
+            group = header.group(1)
+        if entry := re.fullmatch(r"([ \t]*[^=\s#;]+[ \t]*=[ \t]*)([^\r\n]*?)([ \t]*\r?\n?)", line):
+            key = (group, entry[1].partition("=")[0].strip())
+            if key in remaining:
+                line = entry[1] + remaining.pop(key) + entry[3]
+        lines.append(line)
+    if remaining:
+        raise Unsupported(f"Cannot find exact lines for {tuple(remaining)}.")
+    return "".join(lines).encode("utf-8")
+
+
+@dataclass(frozen=True)
+class Axis:
+    adjust: int
+    pitch: int
+    origin: int
+    count: int
+
+    @classmethod
+    def for_area(cls, length, adjust, axis, vertical_offset):
+        pitch = int((130 if axis == 0 else 100) * (adjust / 100.0))
+        inset = pitch // 2 - 24 if axis == 0 else max(0, pitch // 2 - vertical_offset)
+        return cls(adjust, pitch, (length % pitch) // 2 + inset, length // pitch)
+
+    def pixel(self, cell):
+        return self.origin + cell * self.pitch
+
+    def cell(self, pixel):
+        index = round((pixel - self.origin) / self.pitch)
+        if not 0 <= index < self.count or abs(self.pixel(index) - pixel) >= self.pitch / 2:
+            raise Unsupported(f"Saved coordinate {pixel} does not identify a unique cell (origin {self.origin}, pitch {self.pitch}).")
+        return index
+
+
+def slot_pixel(axis, index, inset):
+    limit = axis.pitch // 2 - 1
+    return max(0, axis.pixel(index) + max(-limit, min(limit, inset)))
+
+
+@dataclass(frozen=True)
+class AxisChoice:
+    grid: Axis
+    leading: int
+    trailing: int
+    margin_shortfall: int
+    pitch_shortfall: int
+    overlaps: int
+    outer_cost: int
+    pitch_cost: int
+
+    @property
+    def adjust(self):
+        return self.grid.adjust
+
+
+@lru_cache(maxsize=256)
+def axis_candidates(length, axis, offset, target_margin, min_margin, min_label,
+                    target_pitch, min_pitch, preferred_max, footprints, row_reserve=0):
+    low = 50 if axis == 0 else 75
+    result = []
+    for adjust in range(low, 201):
+        grid = Axis.for_area(length, adjust, axis, offset)
+        if grid.pitch < row_reserve or not grid.count or any(index >= grid.count for index, *_ in footprints):
+            continue
+        intervals = []
+        for index, inset, before, after in footprints:
+            planned = slot_pixel(grid, index, inset)
+            nominal = grid.pixel(index)
+            intervals.append((min(planned, nominal) - before, max(planned, nominal) + after))
+        leading = min((left for left, _ in intervals), default=length)
+        trailing = length - max((right for _, right in intervals), default=0)
+        if min(leading, trailing) < 0:
+            continue
+        mask = bit = 0
+        for i, (left, right) in enumerate(intervals):
+            for other_left, other_right in intervals[i+1:]:
+                # The bottom 6 px are selection highlight, not label ink.
+                highlight = 6 if axis == 1 else 0
+                if left < other_right - highlight and other_left < right - highlight:
+                    mask |= 1 << bit
+                bit += 1
+        origin = grid.origin
+        margin_shortfall = max(0, min_margin - origin) + max(0, min_label - min(leading, trailing))
+        band = max(0, target_margin - 5 - origin, origin - target_margin - 10)
+        outer = abs(origin - target_margin) + 3 * band + 2 * max(0, grid.pitch - preferred_max)
+        result.append(AxisChoice(grid, leading, trailing, margin_shortfall,
+                                 max(0, min_pitch - grid.pitch), mask, outer,
+                                 abs(grid.pitch - target_pitch)))
+    return tuple(sorted(result, key=lambda item: (item.margin_shortfall, item.pitch_shortfall, item.outer_cost)))
+
+
+def layout_score(x, y, label_height):
+    mismatch = abs(x.grid.origin - y.grid.origin)
+    outer = x.outer_cost + y.outer_cost + mismatch + 4 * max(0, mismatch - 3)
+    # Eighth-pixel units avoid floating point ties. Whitespace is scored only
+    # after pitch, so its proportional targets cannot pull the grid apart.
+    common_twice = x.grid.origin + y.grid.origin
+    whitespace = (abs(8 * (x.grid.pitch - 48) - 5 * common_twice)
+                  + abs(8 * (y.grid.pitch - label_height) - 2 * common_twice))
+    return (x.margin_shortfall + y.margin_shortfall, x.pitch_shortfall + y.pitch_shortfall,
+            outer, x.pitch_cost + y.pitch_cost, whitespace)
+
+
+def two_line_row_pitch(single_line_height):
+    line_height = single_line_height - 48 - 2
+    return single_line_height + line_height + 6
+
+
+def best_layout(width, height, offset, label_height, args, current, footprints):
+    row_reserve = two_line_row_pitch(label_height)
+    axes = [
+        axis_candidates(length, i, offset, args.margin[i], args.min_margin[i],
+                        args.min_label_clearance, args.pitch[i], args.min_pitch[i],
+                        args.preferred_max_pitch[i], tuple(footprints[i]),
+                        row_reserve if i == 1 else 0)
+        for i, length in enumerate((width, height))
+    ]
+    if not axes[1]:
+        raise Unsupported(f"No grid fits the saved rows with {row_reserve} px reserved for two-line labels.")
+    if not axes[0]:
+        raise Unsupported("No grid fits the saved columns and label bounds within the work area.")
+
+    def score(x, y):
+        movement = abs(x.adjust - current[0]) + abs(y.adjust - current[1])
+        return (*layout_score(x, y, label_height), movement, x.adjust, y.adjust)
+
+    best = winner = None
+    for x in axes[0]:
+        for y in axes[1]:
+            lower = (x.margin_shortfall + y.margin_shortfall, x.pitch_shortfall + y.pitch_shortfall,
+                     x.outer_cost + y.outer_cost)
+            if best is not None and lower > best[:3]:
+                break
+            if x.overlaps & y.overlaps:
+                continue
+            value = score(x, y)
+            if best is None or value < best:
+                best, winner = value, (x, y)
+    if winner is None:
+        raise Unsupported("No grid fits the saved icons without estimated overlap.")
+
+    existing = [next((item for item in options if item.adjust == adjust), None)
+                for options, adjust in zip(axes, current)]
+    if args.hysteresis and all(existing) and not existing[0].overlaps & existing[1].overlaps:
+        previous = score(*existing)
+        if (previous[0] == best[0] == 0 and previous[1] == best[1]
+                and abs(existing[0].grid.origin - existing[1].grid.origin)
+                    <= abs(winner[0].grid.origin - winner[1].grid.origin) + args.hysteresis
+                and previous[2] <= best[2] + 5 * args.hysteresis
+                and previous[3] <= best[3] + 2 * args.hysteresis):
+            return existing
+    return winner
+
+
+def adjustment(config):
+    raw = config.get(GROUP, ADJUST, fallback="")
+    match = re.fullmatch(r"(\d+);(\d+);", raw)
+    if not match:
+        raise Unsupported("Set Nemo's per-monitor spacing once before using this prototype.")
+    h, v = map(int, match.groups())
+    if not (50 <= h <= 200 and 75 <= v <= 200):
+        raise Unsupported(f"Unsupported saved spacing {h};{v}.")
+    return h, v
+
+
+class Desktop:
+    def __init__(self):
+        if os.geteuid() == 0:
+            raise Unsupported("Run as the Cinnamon desktop user.")
+        if os.environ.get("XDG_SESSION_TYPE") != "x11":
+            raise Unsupported("An X11 desktop session is required.")
+        self.display = Gdk.Display.get_default()
+        if self.display is None or type(self.display).__name__ != "X11Display":
+            raise Unsupported("GTK is not connected to X11.")
+        self.settings = Gio.Settings.new("org.nemo.desktop")
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.volume_monitor = Gio.VolumeMonitor.get()
+        self.mount_labels = {}
+        self.label = Gtk.Label()
+        self.journal = STATE / "transaction.json"
+        self.checkpoint = STATE / "grid.json"
+
+    def call(self, dest, path, interface, method, params=None):
+        return self.bus.call_sync(dest, path, interface, method, params, None,
+                                  Gio.DBusCallFlags.NONE, 1200, None).unpack()
+
+    def session(self, method, params=None):
+        return self.call(SESSION, SESSION_PATH, SESSION, method, params)
+
+    def check_session(self):
+        if not self.session("IsSessionRunning")[0]:
+            raise Unsupported("Cinnamon is not in its running session phase.")
+        if not self.session("IsAutostartConditionHandled", GLib.Variant("(s)", (CONDITION,)))[0]:
+            raise Unsupported("Cinnamon does not manage Nemo through its native autostart condition.")
+        if not self.settings.is_writable(SETTING):
+            raise Unsupported("Nemo's desktop icon setting is locked.")
+
+    def owner_pid(self):
+        try:
+            return self.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                             "GetConnectionUnixProcessID", GLib.Variant("(s)", (DESKTOP,)))[0]
+        except GLib.Error as error:
+            if (Gio.DBusError.get_remote_error(error) or "").endswith(".NameHasNoOwner"):
+                return None
+            raise
+
+    def client_pid(self):
+        interface = SESSION + ".Client"
+        for path in self.session("GetClients")[0]:
+            try:
+                if self.call(SESSION, path, interface, "GetAppId")[0] == "nemo-autostart.desktop":
+                    return self.call(SESSION, path, interface, "GetUnixProcessId")[0]
+            except GLib.Error as error:
+                if not (Gio.DBusError.get_remote_error(error) or "").endswith(".UnknownMethod"):
+                    raise
+        return None
+
+    def mapped_pid(self):
+        pid = self.owner_pid()
+        if pid is None or self.client_pid() != pid:
+            return None
+        window = subprocess.run(["xwininfo", "-name", "Desktop"], capture_output=True,
+                                text=True, timeout=2)
+        if "Map State: IsViewable" in window.stdout:
+            return pid
+        return None
+
+    def set_enabled(self, enabled):
+        if not self.settings.set_boolean(SETTING, enabled):
+            raise RuntimeError(f"Cinnamon rejected {SETTING}={enabled}.")
+        Gio.Settings.sync()
+
+    def area(self):
+        if self.display.get_n_monitors() != 1:
+            raise Unsupported("Exactly one active monitor is required.")
+        monitor = self.display.get_monitor(0)
+        screen, work = monitor.get_geometry(), monitor.get_workarea()
+        if (monitor.get_scale_factor() != 1 or screen.x or screen.y or work.x or work.y
+                or not 1 <= work.width <= screen.width or not 1 <= work.height <= screen.height):
+            raise Unsupported("Only scale-1 layouts with a top-left work-area origin are supported.")
+        return monitor.get_model(), work.width, work.height
+
+    def verify_randr(self):
+        result = subprocess.run(["xrandr", "--listactivemonitors"], capture_output=True,
+                                check=True, text=True, timeout=2)
+        lines = result.stdout.splitlines()
+        if not lines or lines[0].strip() != "Monitors: 1" or len(lines) != 2 or len(lines[1].split()) != 4:
+            raise Unsupported("The RandR layout has multiple or cloned outputs.")
+
+    def check_icons(self):
+        if not self.settings.get_boolean("use-desktop-grid"):
+            raise Unsupported("Nemo's modern grid is disabled.")
+        if self.settings.get_string("desktop-layout").split("::")[0] != "true":
+            raise Unsupported("Nemo is not configured to draw icons on the primary monitor.")
+
+    def mount_groups(self):
+        self.mount_labels.clear()
+        if not self.settings.get_boolean("volumes-visible"):
+            return {}
+        groups = {}
+        for mount in self.volume_monitor.get_mounts():
+            if mount.is_shadowed():
+                continue
+            volume = mount.get_volume()
+            name = volume.get_name() if volume else mount.get_name()
+            group = name.replace("/", "-") + ".volume"
+            if group in groups:
+                raise Unsupported("More than one mount has the same Nemo metadata name.")
+            # Keep the identity stable across desktop restarts without storing URIs.
+            self.mount_labels[group] = mount.get_name()
+            root_uri = mount.get_root().get_uri()
+            groups[group] = hashlib.sha256(root_uri.encode("utf-8")).hexdigest()
+        return groups
+
+    def file_icons(self):
+        prefs = Gio.Settings.new("org.nemo.preferences")
+        directory = (str(Path.home()) if prefs.get_boolean("desktop-is-home-dir")
+                     else GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DESKTOP))
+        if not directory or not Path(directory).is_dir():
+            raise Unsupported("Cannot find Nemo's desktop folder.")
+        root = Path(directory)
+        hidden = set()
+        hidden_file = root / ".hidden"
+        if hidden_file.is_file():
+            hidden = set(hidden_file.read_text(encoding="utf-8").splitlines())
+        result = {}
+        for path in sorted(root.iterdir()):
+            if path.name.startswith(".") or path.name.endswith("~") or path.name in hidden:
+                continue
+            entry = read_file_icon(path)
+            if entry is not None:
+                result["file:" + str(path)] = entry
+        return result
+
+    def label_layout(self, text):
+        layout = self.label.create_pango_layout(text)
+        font = self.settings.get_string("font")
+        if font:
+            layout.set_font_description(Pango.FontDescription.from_string(font))
+        return layout
+
+    def label_footprint(self, key):
+        kind, name = key.split(":", 1)
+        if kind == "file":
+            names = [Path(name).name]
+            if name.endswith(".desktop"):
+                app = Gio.DesktopAppInfo.new_from_filename(name)
+                if app and app.get_display_name():
+                    names.append(app.get_display_name())
+        elif name in ICONS:
+            labels = dict(computer="Computer", home="Home", trash="Trash", network="Network Servers")
+            names = [gettext.dgettext("nemo", labels[name])]
+        else:
+            names = [self.mount_labels.get(name, name.removesuffix(".volume"))]
+
+        # Nemo 6.4 uses a fixed 110 px Normal label width, centered beneath
+        # the image, and adds 8 px of horizontal highlight padding.
+        width, height = 0, 0
+        lines = max(1, self.settings.get_int("text-ellipsis-limit"))
+        line_height = self.label_layout("Test").get_pixel_size()[1]
+        for label in names:
+            layout = self.label_layout(label)
+            layout.set_width(110 * Pango.SCALE)
+            layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+            width = max(width, min(110, layout.get_pixel_size()[0]) + 8)
+            height = max(height, min(lines, layout.get_line_count()) * line_height)
+        left = max(0, width // 2 - 24)
+        right = max(48, 24 + (width + 1) // 2)
+        return (left, right), (0, 48 + height + 8)
+
+    def vertical_offset(self):
+        lines = self.settings.get_int("text-ellipsis-limit")
+        return (lines * self.label_layout("Test").get_pixel_size()[1] + 48 + 4 + 1) // 2
+
+    def read(self):
+        info = METADATA.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+            raise Unsupported("Nemo metadata is not a regular user-owned file.")
+        return METADATA.read_bytes(), stat.S_IMODE(info.st_mode)
+
+    def recover(self):
+        pending = read_json(self.journal)
+        if not pending:
+            return
+        self.check_session()
+        log("Recovering the previous grid transaction.")
+        enabled = self.settings.get_boolean(SETTING)
+        position_repair = pending.get("position_repair")
+        try:
+            if pending.get("files") or position_repair:
+                pid = self.owner_pid() or self.client_pid()
+                if enabled and pid:
+                    self.set_enabled(False)
+                wait_until(lambda: not self.owner_pid() and not self.client_pid()
+                           and (not pid or not Path(f"/proc/{pid}").exists()),
+                           "Cinnamon to stop Nemo Desktop for recovery")
+            current = adjustment(parse_metadata(self.read()[0]))
+            expected = None
+            for candidate in ("new", "old"):
+                if tuple(pending[candidate]["adjust"]) == current:
+                    expected = candidate
+                    break
+            if expected is None:
+                raise RuntimeError("The grid was edited independently. Keeping the recovery journal.")
+            if position_repair and current == tuple(pending["old"]["adjust"]):
+                expected = "new" if position_repair["committed"] else "old"
+                latest, mode = self.read()
+                repairs = recover_icon_positions(parse_metadata(latest), position_repair, expected)
+                if repairs:
+                    atomic_write(METADATA, patch_metadata(latest, repairs), mode)
+            for change in pending.get("files", []):
+                file_update(change, expected == "new", recover=True)
+        finally:
+            if not self.settings.get_boolean(SETTING):
+                self.set_enabled(True)
+        try:
+            wait_until(self.mapped_pid, "the recovered desktop window")
+        except RuntimeError:
+            if self.owner_pid() or self.client_pid():
+                raise
+            try:
+                self.set_enabled(False)
+                time.sleep(0.25)
+            finally:
+                self.set_enabled(True)
+            wait_until(self.mapped_pid, "the recovered desktop window")
+        write_json(self.checkpoint, pending[expected])
+        self.journal.unlink()
+        sync_directory(STATE)
+
+
+
+GIO_POSITION = "metadata::" + POSITION
+GIO_ATTRIBUTES = "standard::is-hidden,standard::is-backup,metadata::monitor,metadata::icon-scale," + GIO_POSITION
+
+
+def file_identity(path):
+    info = path.lstat()
+    return [info.st_dev, info.st_ino, info.st_ctime_ns]
+
+
+def read_file_icon(path):
+    identity = file_identity(path)
+    file = Gio.File.new_for_path(str(path))
+    info = file.query_info(GIO_ATTRIBUTES, Gio.FileQueryInfoFlags.NONE, None)
+    if info.get_is_hidden() or info.get_is_backup():
+        return None
+    return {"position": info.get_attribute_string(GIO_POSITION),
+            "monitor": info.get_attribute_string("metadata::monitor"),
+            "scale": info.get_attribute_string("metadata::icon-scale"),
+            "identity": identity}
+
+
+def file_update(change, commit, recover=False):
+    path = Path(change["path"])
+    try:
+        info = read_file_icon(path)
+    except FileNotFoundError:
+        info = None
+    if info is None or info["identity"] != change["identity"]:
+        if recover:
+            log(f"Skipping removed, renamed, or replaced desktop file: {path.name!r}")
+            return
+        raise Unsupported(f"Desktop file changed during the transaction: {path.name!r}.")
+    position = info["position"]
+    old, new = change["old"], change["new"]
+    if position not in (old, new):
+        if recover:
+            log(f"Keeping a newer desktop position for {path.name!r}.")
+            return
+        raise Unsupported(f"Desktop file position changed during the transaction: {path.name!r}.")
+    target = new if commit else old
+    if position == target:
+        return
+    file = Gio.File.new_for_path(str(path))
+    if not file.set_attribute_string(GIO_POSITION, target, Gio.FileQueryInfoFlags.NONE, None):
+        raise RuntimeError(f"GVfs rejected the desktop position for {path.name!r}.")
+    updated = read_file_icon(path)
+    if not updated or updated["identity"] != change["identity"] or updated["position"] != target:
+        raise RuntimeError(f"GVfs did not retain the desktop position for {path.name!r}.")
+
+
+
+def grid_record(area, adjustments, offset):
+    return {"area": list(area), "adjust": list(adjustments), "offset": offset}
+
+
+def plan(desktop, args, area, data):
+    config = parse_metadata(data)
+    if any(group.startswith("desktop-monitor-") and group != GROUP for group in config.sections()):
+        raise Unsupported("Nemo metadata contains additional monitor groups.")
+    if (config.getboolean(GROUP, "nemo-icon-view-auto-layout", fallback=True)
+            or not config.getboolean(GROUP, "nemo-icon-view-keep-aligned", fallback=False)
+            or config.getint(GROUP, "nemo-icon-view-zoom-level", fallback=-1) != 3):
+        raise Unsupported("Require Auto-arrange off, Align to grid on and explicit Normal icon size (zoom 3).")
+    current = adjustment(config)
+    offset = desktop.vertical_offset()
+    previous = read_json(desktop.checkpoint)
+    old_area, old_offset, old_cells = area, offset, {}
+    resize = False
+    if args.old_area:
+        old_area = area[0], *args.old_area
+    elif previous and previous["area"][0] == area[0] and tuple(previous["adjust"]) == current:
+        old_area, old_offset = tuple(previous["area"]), previous["offset"]
+        old_cells = previous.get("cells", {})
+        resize = (getattr(args, "watch", False)
+                  and tuple(previous.get("observed_area", previous["area"])) != area)
+    old_axes = [Axis.for_area(length, adjust, i, old_offset)
+                for i, (length, adjust) in enumerate(zip(old_area[1:], current))]
+    current_axes = [Axis.for_area(length, adjust, i, offset)
+                    for i, (length, adjust) in enumerate(zip(area[1:], current))]
+
+    groups = [icon for icon in ICONS if desktop.settings.get_boolean(f"{icon}-icon-visible")]
+    mounts = desktop.mount_groups()
+    groups.extend(mounts)
+    entries = desktop.file_icons()
+    for group in groups:
+        entries["group:" + group] = {
+            "position": config.get(group, POSITION, fallback=None),
+            "monitor": config.get(group, "monitor", fallback=None),
+            "scale": config.get(group, "icon-scale", fallback="1"),
+            "identity": mounts.get(group),
+        }
+
+    icons = {}
+    occupied = {}
+    for key, entry in entries.items():
+        name = icon_name(key)
+        point = re.fullmatch(r"(\d+),\s*(\d+)", entry["position"] or "")
+        if not point:
+            raise AwaitingPlacement(f"{name!r} has no saved Nemo position yet.")
+        if entry["monitor"] not in ("0", "-1", None) or float(entry["scale"] or 1) != 1.0:
+            raise Unsupported(f"{name!r} has an unsupported monitor or icon scale.")
+        xy = tuple(map(int, point.groups()))
+        saved = old_cells.get(key)
+        if (saved and saved.get("identity") == entry["identity"]
+                and (resize or saved["xy"] == list(xy))):
+            cell, inset = tuple(saved["cell"]), tuple(saved["inset"])
+        else:
+            # Nemo can re-align icons after a resize even in manual mode.
+            # Use the geometry whose slot best fits the saved anchor.
+            candidates = []
+            for reference in (old_axes,) if args.old_area else (old_axes, current_axes):
+                try:
+                    indexes = tuple(axis.cell(pixel) for axis, pixel in zip(reference, xy))
+                except Unsupported:
+                    continue
+                remainder = tuple(p - a.pixel(i) for a, p, i in zip(reference, xy, indexes))
+                candidate = (sum(map(abs, remainder)), indexes, remainder)
+                if candidate not in candidates:
+                    candidates.append(candidate)
+            if not candidates:
+                raise Unsupported(f"{name!r} has no usable cell in the old or current work area.")
+            candidates.sort()
+            if (len(candidates) > 1 and candidates[0][0] == candidates[1][0]
+                    and candidates[0][1] != candidates[1][1]):
+                raise Unsupported(f"{name!r} has equally plausible cells in the old and current work areas.")
+            _, cell, inset = candidates[0]
+        if cell in occupied:
+            raise Unsupported(f"{name!r} and {occupied[cell]!r} both occupy cell {cell}.")
+        occupied[cell] = name
+        icons[key] = xy, cell, inset, entry
+
+    footprints = [[], []]
+    for key, (_, cell, inset, _) in icons.items():
+        for i, (before, after) in enumerate(desktop.label_footprint(key)):
+            footprints[i].append((cell[i], 0, before, after))
+    single_line_height = 48 + desktop.label_layout("Test").get_pixel_size()[1] + 2
+    choices = best_layout(*area[1:], offset, single_line_height, args, current, footprints)
+    axes = [choice.grid for choice in choices]
+    selected = tuple(axis.adjust for axis in axes)
+    old = grid_record(old_area, current, old_offset)
+    new = grid_record(area, selected, offset)
+    old["observed_area"] = new["observed_area"] = list(area)
+    old["cells"] = {}
+    new["cells"] = {}
+    updates = {(GROUP, ADJUST): f"{selected[0]};{selected[1]};"}
+    relocated, files = {}, []
+    for key, (xy, cell, inset, entry) in icons.items():
+        # Keep the logical slot while removing stale offsets from a prior grid.
+        delta = (0, 0)
+        target = tuple(slot_pixel(axis, index, n) for axis, index, n in zip(axes, cell, delta))
+        before = {"xy": list(xy), "cell": list(cell), "inset": list(inset), "identity": entry["identity"]}
+        old["cells"][key] = before
+        new["cells"][key] = dict(before, xy=list(target), inset=list(delta))
+        relocated[key] = xy, cell, target
+        position = f"{target[0]},{target[1]}"
+        kind, name = key.split(":", 1)
+        if kind == "group":
+            updates[name, POSITION] = position
+        elif position != entry["position"]:
+            files.append({"path": name, "identity": entry["identity"],
+                          "old": entry["position"], "new": position})
+    return old, new, axes, relocated, updates, files, choices
+
+
+def icon_name(key):
+    kind, name = key.split(":", 1)
+    return Path(name).name if kind == "file" else name
+
+
+
+def recover_icon_positions(config, repair, side):
+    updates = {}
+    for name, (old, new) in repair["groups"].items():
+        current = config.get(name, POSITION, fallback=None)
+        target = new if side == "new" else old
+        if current in (old, new) and current != target:
+            updates[name, POSITION] = target
+    return updates
+
+
+def apply(desktop, args, expected_area=None):
+    pump()
+    if not desktop.settings.get_boolean(SETTING):
+        log("Desktop icons are disabled. Skipping.")
+        return
+    area = desktop.area()
+    if expected_area and area != expected_area:
+        raise Unsupported("The work area changed during the attempt.")
+    desktop.verify_randr()
+    desktop.check_icons()
+    if desktop.settings.get_boolean("volumes-visible"):
+        # GVfs can publish its first mount snapshot just after GDK startup.
+        desktop.mount_groups()
+        time.sleep(0.12)
+        pump()
+    data, _ = desktop.read()
+    old, new, axes, icons, updates, files, choices = plan(desktop, args, area, data)
+    log(f"{area[0]} work area {area[1]}x{area[2]}: {old['adjust']} -> {new['adjust']} percent; "
+        f"icon origin {axes[0].origin},{axes[1].origin}; pitch {axes[0].pitch}x{axes[1].pitch}")
+    log(f"  Nominal margin mismatch {abs(axes[0].origin-axes[1].origin)} px; "
+        f"estimated bounds clearance L/T/R/B {choices[0].leading}/{choices[1].leading}/"
+        f"{choices[0].trailing}/{choices[1].trailing} px.")
+    font_line = desktop.label_layout("Test").get_pixel_size()[1]
+    log(f"  Two-line label reserve: {two_line_row_pitch(48 + font_line + 2)} px per row.")
+    for label, choice in zip(("horizontal", "vertical"), choices):
+        if choice.margin_shortfall or choice.pitch_shortfall:
+            log(f"  {label.capitalize()} fallback: margin shortfall {choice.margin_shortfall} px, "
+                f"pitch shortfall {choice.pitch_shortfall} px.")
+    if args.dry_run or args.verbose:
+        for name, (before, cell, after) in icons.items():
+            log(f"  {icon_name(name)!r}: {before} -> {after}, column {cell[0]}, row {cell[1]}")
+    same_spacing = old["adjust"] == new["adjust"]
+    misaligned = any(before != after for before, _, after in icons.values())
+    if same_spacing and not misaligned:
+        log("Existing spacing and icon positions are already selected. No restart.")
+        if not args.dry_run:
+            write_json(desktop.checkpoint, old)
+        return
+    if same_spacing:
+        log("Existing spacing is already selected. Realigning saved icon positions.")
+    if args.dry_run:
+        return
+
+    desktop.check_session()
+    pid = wait_until(desktop.mapped_pid, "the Cinnamon-managed desktop window")
+    pump()
+    if not desktop.settings.get_boolean(SETTING):
+        log("Desktop icons became disabled. Skipping.")
+        return
+    transaction = {"old": old, "new": new, "files": files}
+    if same_spacing:
+        repair_groups = {}
+        for key, (before, _, after) in icons.items():
+            kind, name = key.split(":", 1)
+            if kind == "group" and before != after:
+                repair_groups[name] = [f"{before[0]},{before[1]}", updates[name, POSITION]]
+        transaction["position_repair"] = {"groups": repair_groups, "committed": False}
+    write_json(desktop.journal, transaction)
+    start = time.monotonic()
+    try:
+        desktop.set_enabled(False)
+        wait_until(lambda: not desktop.owner_pid() and not desktop.client_pid()
+                   and not Path(f"/proc/{pid}").exists(), "Nemo Desktop to exit")
+        stopped = time.monotonic()
+        if desktop.area() != area:
+            raise Unsupported("The work area changed after the desktop stopped.")
+        desktop.verify_randr()
+        desktop.check_icons()
+        latest, mode = desktop.read()
+        observed = plan(desktop, args, area, latest)
+        if observed != (old, new, axes, icons, updates, files, choices):
+            raise Unsupported("The grid changed during shutdown. Skipping the write.")
+        pump()
+        if desktop.area() != area or desktop.owner_pid() or desktop.settings.get_boolean(SETTING):
+            raise Unsupported("The work area or desktop lifecycle changed before writing.")
+        try:
+            for change in files:
+                file_update(change, commit=True)
+            atomic_write(METADATA, patch_metadata(latest, updates), mode)
+            if same_spacing:
+                transaction["position_repair"]["committed"] = True
+                write_json(desktop.journal, transaction)
+        except BaseException:
+            if same_spacing:
+                pending = read_json(desktop.journal)["position_repair"]
+                if not pending["committed"]:
+                    current_data, current_mode = desktop.read()
+                    repairs = recover_icon_positions(parse_metadata(current_data), pending, "old")
+                    if repairs:
+                        atomic_write(METADATA, patch_metadata(current_data, repairs), current_mode)
+                    for change in files:
+                        file_update(change, commit=False, recover=True)
+            # For spacing changes, desktop-metadata remains the commit record.
+            elif adjustment(parse_metadata(desktop.read()[0])) == tuple(old["adjust"]):
+                for change in files:
+                    file_update(change, commit=False, recover=True)
+            raise
+    finally:
+        desktop.set_enabled(True)
+
+    new_pid = wait_until(desktop.mapped_pid, "the replacement desktop window")
+    if new_pid == pid:
+        raise RuntimeError("The expected replacement Nemo Desktop process did not appear.")
+    actual = parse_metadata(desktop.read()[0])
+    if adjustment(actual) != tuple(new["adjust"]):
+        raise RuntimeError("Nemo did not retain the selected grid spacing.")
+    actual_files = desktop.file_icons()
+    for key, (_, cell, _) in icons.items():
+        kind, name = key.split(":", 1)
+        raw = (actual.get(name, POSITION, fallback=None) if kind == "group"
+               else actual_files.get(key, {}).get("position"))
+        point = re.fullmatch(r"(\d+),\s*(\d+)", raw or "")
+        if not point:
+            raise RuntimeError(f"Nemo lost the position of {icon_name(key)!r}.")
+        xyz = tuple(map(int, point.groups()))
+        if tuple(axis.cell(pixel) for axis, pixel in zip(axes, xyz)) != cell:
+            raise RuntimeError(f"Nemo moved {icon_name(key)!r} to a different grid cell.")
+        new["cells"][key]["xy"] = list(xyz)
+        new["cells"][key]["inset"] = [p - a.pixel(i) for a, p, i in zip(axes, xyz, cell)]
+    write_json(desktop.checkpoint, new)
+    desktop.journal.unlink()
+    sync_directory(STATE)
+    log(f"Nemo Desktop {pid} -> {new_pid}; stop {(stopped-start)*1000:.0f} ms, "
+        f"edit and remap {(time.monotonic()-stopped)*1000:.0f} ms.")
+
+
+def watch(desktop, args):
+    missing = object()
+    pending = handled = missing
+    since = time.monotonic()
+    retries = 0
+    next_snapshot = time.monotonic()
+    log(f"Watching the X11 work area with a {args.debounce:.2f} s debounce.")
+    while True:
+        pump()
+        try:
+            key = desktop.area(), desktop.settings.get_boolean(SETTING)
+        except Unsupported as error:
+            key = str(error), False
+        if key != pending:
+            pending, since, retries = key, time.monotonic(), 0
+        if pending != handled and time.monotonic() - since >= args.debounce:
+            handled = pending
+            area, enabled = key
+            try:
+                if isinstance(area, str):
+                    log(f"Skipping: {area}")
+                elif enabled:
+                    apply(desktop, args, area)
+                else:
+                    log("Desktop icons are disabled. Waiting for a change.")
+            except Unsupported as error:
+                if desktop.journal.exists() and not args.dry_run:
+                    desktop.recover()
+                if isinstance(error, AwaitingPlacement) and retries < 3:
+                    retries += 1
+                    handled = missing
+                    since = time.monotonic()
+                    log(f"Waiting for Nemo to place a new icon: {error}")
+                else:
+                    log(f"Skipping: {error}")
+        if (pending == handled and time.monotonic() >= next_snapshot
+                and isinstance(key[0], tuple) and key[1] and not args.dry_run):
+            next_snapshot = time.monotonic() + 1
+            try:
+                # Remember deliberate moves at a settled resolution before
+                # Nemo can re-align those icons during the next resize.
+                desktop.check_icons()
+                snapshot, *_ = plan(desktop, args, key[0], desktop.read()[0])
+                if snapshot != read_json(desktop.checkpoint) and desktop.area() == key[0]:
+                    write_json(desktop.checkpoint, snapshot)
+            except (Unsupported, FileNotFoundError):
+                pass
+        time.sleep(min(0.20, args.debounce / 2))
+
+
+def dimensions(value):
+    if match := re.fullmatch(r"(\d+)[x,](\d+)", value):
+        return tuple(map(int, match.groups()))
+    raise argparse.ArgumentTypeError("Expected two integers separated by x or a comma.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--once", action="store_true", help="Apply once (default)")
+    modes.add_argument("--watch", action="store_true", help="Monitor resolution changes in the foreground")
+    modes.add_argument("--recover", action="store_true", help="Restore desktop icons after an interrupted transaction")
+    parser.add_argument("--dry-run", action="store_true", help="Calculate positions without writing settings or files")
+    parser.add_argument("--verbose", action="store_true", help="Print the logical cell of each icon")
+    parser.add_argument("--margin", type=dimensions, default=(25, 25), metavar="LEFT,TOP",
+                        help="Target nominal image margins (default: 25,25)")
+    parser.add_argument("--min-margin", type=dimensions, default=(15, 15), metavar="X,Y",
+                        help="Minimum nominal image margins (default: 15,15)")
+    parser.add_argument("--min-label-clearance", type=int, default=10, metavar="PIXELS",
+                        help="Minimum estimated icon and label clearance (default: 10)")
+    parser.add_argument("--pitch", type=dimensions, default=(80, 85), metavar="X,Y",
+                        help="Target cell pitch in pixels (default: 80x85)")
+    parser.add_argument("--min-pitch", type=dimensions, default=(70, 75), metavar="X,Y",
+                        help="Minimum cell pitch in pixels (default: 70x75)")
+    parser.add_argument("--preferred-max-pitch", type=dimensions, default=(100, 110), metavar="X,Y",
+                        help="Soft pitch ceilings in pixels (default: 100x110)")
+    parser.add_argument("--debounce", type=float, default=0.65, metavar="SECONDS")
+    parser.add_argument("--hysteresis", type=int, default=2, metavar="PIXELS")
+    parser.add_argument("--old-area", type=dimensions, metavar="WIDTHxHEIGHT",
+                        help="Known work area of existing positions, for a one-shot run")
+    args = parser.parse_args()
+    if (not all(1 <= n <= 8192 for n in (*args.pitch, *args.min_pitch, *args.preferred_max_pitch))
+            or not all(0 <= n <= 8192 for n in (*args.margin, *args.min_margin, args.min_label_clearance))
+            or not 0.10 <= args.debounce <= 30 or not 0 <= args.hysteresis <= 8192):
+        parser.error("Invalid pitch, margin, debounce, or hysteresis.")
+    if args.old_area and (args.watch or args.recover or min(args.old_area) < 1):
+        parser.error("--old-area requires a positive width and height and is for one-shot use.")
+    if args.recover and args.dry_run:
+        parser.error("--recover cannot be combined with --dry-run.")
+
+    def interrupt(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupt)
+    signal.signal(signal.SIGHUP, interrupt)
+    desktop = Desktop()
+    if args.dry_run:
+        if desktop.journal.exists():
+            log("An earlier transaction is pending. Use --recover before applying changes.")
+        watch(desktop, args) if args.watch else apply(desktop, args)
+        return
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (STATE / "lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError("Another nemo-grid-compensator process is running.") from error
+        desktop.recover()
+        if args.recover:
+            log("No interrupted transaction remains.")
+            return
+        try:
+            if args.watch:
+                watch(desktop, args)
+            else:
+                apply(desktop, args)
+        except (KeyboardInterrupt, RuntimeError, OSError, GLib.Error, subprocess.SubprocessError):
+            if desktop.journal.exists():
+                try:
+                    desktop.recover()
+                except (RuntimeError, OSError, GLib.Error, subprocess.SubprocessError) as error:
+                    log(f"Recovery pending: {error}")
+            raise
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except (OSError, ValueError, RuntimeError, configparser.Error, GLib.Error, subprocess.SubprocessError) as error:
+        sys.exit(f"nemo-grid-compensator: {error}")

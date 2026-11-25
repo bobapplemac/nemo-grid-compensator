@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Nemo Grid Compensator
+Comment=Start the grid compensator for this Cinnamon session
+Exec=/bin/sh -c "exec ~/.local/libexec/nemo-grid-compensator-session"
+OnlyShowIn=X-Cinnamon;
+TryExec=systemd-run
+NoDisplay=true

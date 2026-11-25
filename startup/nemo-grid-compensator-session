@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+[ "${XDG_SESSION_TYPE:-}" = x11 ] || exit 0
+[ -n "${DISPLAY:-}" ] && [ -n "${XDG_SESSION_ID:-}" ] || exit 0
+: "${XDG_RUNTIME_DIR:?A systemd user runtime directory is required}"
+session_bus=${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}
+DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+export DBUS_SESSION_BUS_ADDRESS
+exec /usr/bin/systemd-run --user --collect --unit=nemo-grid-compensator \
+    --description="Nemo Grid Compensator" \
+    --property=Restart=on-failure --property=RestartSec=5s --property=RestartPreventExitStatus=78 \
+    --property=StartLimitIntervalSec=60s --property=StartLimitBurst=3 \
+    --property=TimeoutStopSec=30s --property=StandardOutput=journal --property=StandardError=journal \
+    --setenv="DISPLAY=$DISPLAY" --setenv="XDG_SESSION_TYPE=x11" \
+    --setenv="XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority}" \
+    --setenv="DBUS_SESSION_BUS_ADDRESS=$session_bus" --setenv="HOME=$HOME" \
+    --setenv="XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}" \
+    --setenv="XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}" \
+    --setenv="XDG_STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}" \
+    "$HOME/.local/bin/nemo-grid-compensator" --watch --initialize --session-id "$XDG_SESSION_ID"

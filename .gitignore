@@ -1,0 +1,44 @@
+# Python bytecode, test caches, and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.venv/
+venv/
+env/
+
+# Extracted Debian test tools and generated private test profiles
+/test-tools/
+/profile.*/
+/login.*/
+/reviewed-baseline
+*.log
+
+# Build and distribution output
+/build/
+/dist/
+*.egg-info/
+
+# Local configuration and temporary files
+.env
+.env.*
+!.env.example
+*.local
+*.tmp
+*.temp
+*.bak
+*~
+*.swp
+*.swo
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini

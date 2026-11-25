@@ -1,0 +1,2 @@
+# Keep Linux entry points usable even when checked out on Windows.
+* text=auto eol=lf
