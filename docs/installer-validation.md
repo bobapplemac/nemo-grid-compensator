@@ -57,3 +57,33 @@ for this installer-only change; see the earlier
 [publication checks](publication-checks.md#linux-follow-up-validation) for
 their most recent coverage. Live VMware resize, physical drag across resize,
 and real volume timing acceptance scenarios remain outstanding.
+
+## Automatic initialization and startup follow-up
+
+The expanded installer suite passed all 20 tests on the same VM. Additional
+coverage verifies default X11 initialization followed by startup, repeat
+installation without duplicate initialization or launch, `--no-start`
+propagation through archive bootstrapping, explicit `--start` rejection
+outside a graphical session, non-graphical deferral, and preservation of
+existing checkpoints and journals during a graphical upgrade.
+
+The real PAM/logind harness's `INSTALL_DURING_SESSION=1` mode passed:
+
+- Installation with no startup flags in a running private Cinnamon session
+  initialized the required grid keys, wrote a checkpoint, and started the
+  supervised watcher immediately.
+- After initial Nemo metadata writes and watcher startup settled, a repeat
+  installation retained both the watcher PID and byte-identical metadata.
+- Logout stopped the watcher while preserving the shared user manager, and
+  the installed offline uninstaller removed the test installation.
+
+The private launcher and test-only systemctl shim use a separate unit name;
+production startup files are unchanged. The normal desktop service was
+already inactive during this follow-up and was left that way. Its metadata
+and Cinnamon/Nemo owners were unchanged. This is isolated Xvfb coverage, not
+new live VMware resize, drag, or real-volume acceptance coverage.
+
+The original install-before-login harness also passed again with explicit
+`--no-start` during preparation and upgrade, along with all 11 runtime unit
+tests. The normal desktop metadata remained byte-identical throughout both
+successful lifecycle checks.

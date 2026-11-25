@@ -72,21 +72,27 @@ curl -fsSL https://raw.githubusercontent.com/bobapplemac/nemo-grid-compensator/m
 wget -qO- https://raw.githubusercontent.com/bobapplemac/nemo-grid-compensator/main/install.sh | bash
 ```
 
-These install from `main` for the next graphical login. Rerun the same command
-to reinstall or upgrade. The installer downloads one repository archive and
-uses that revision's local installation logic. To select a branch, tag, or
-commit, or to start in the current X11 Cinnamon login, pass arguments to Bash:
+These install from `main`, initialize a supported uninitialized profile, and
+start the supervised watcher immediately when run from your X11 Cinnamon
+session. Automatic startup at future logins is configured too; no separate
+enable command is needed. From SSH or another environment lacking the X11
+session variables, installation defers startup to the next graphical login.
+Rerun the same command to reinstall or upgrade. The installer downloads one
+repository archive and uses that revision's local installation logic.
+To select a branch, tag, or commit, pass arguments to Bash:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bobapplemac/nemo-grid-compensator/main/install.sh | bash -s -- --ref main --start
+curl -fsSL https://raw.githubusercontent.com/bobapplemac/nemo-grid-compensator/main/install.sh | bash -s -- --ref main
 ```
 
 Replace `main` after `--ref` with the desired existing ref. For a
 [download-inspect-execute method](docs/installation.md#inspect-before-executing),
 archive validation details, and dependency guidance, see the
 [installation guide](docs/installation.md). A complete local checkout or
-extracted source archive also supports `./install.sh` and `./install.sh --start`
-without network access; adding `--ref` explicitly requests a GitHub download.
+extracted source archive also supports `./install.sh` without network access;
+adding `--ref` explicitly requests a GitHub download. Use `--no-start` to install
+for the next login only. `--start` explicitly requires immediate startup and
+reports an error if the current X11 session environment is unavailable.
 
 The installer checks dependencies; it does not install distribution packages.
 Debian runtime packages are `cinnamon`, `nemo`, `python3`, `python3-gi`,
@@ -99,8 +105,12 @@ launcher creates a transient systemd user unit at each graphical login; no
 `systemctl enable` step or lingering is needed. Re-running the installer
 upgrades the managed files.
 
-Startup initializes supported fresh profiles automatically. An established
-or partially configured profile may require explicit initialization. With
+Before immediate startup, installation runs initialization when there is no
+saved checkpoint or pending transaction. Existing checkpoints and recovery
+journals retain the normal startup/recovery path. Startup also initializes
+supported fresh profiles automatically after a deferred installation. An
+unsupported or partially configured profile may still require attention; the
+installer does not force conversion of unsupported layouts. With
 the watcher stopped, preview and then apply from the owning Cinnamon session:
 
 ```sh

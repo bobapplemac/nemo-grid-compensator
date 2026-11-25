@@ -40,6 +40,10 @@ is still in progress. This is not the stable v0.1.0 release.
   uninstaller under `~/.local/libexec/`.
 - Document curl, wget, and inspect-first installation. These changes do not
   alter the compensator runtime, optimizer, defaults, or rc2 version.
+- Installations now initialize supported profiles without saved checkpoints
+  or pending journals and start immediately in the current X11 session by
+  default. `--no-start` opts out; non-graphical installs defer startup.
+  Future-login startup remains configured through the existing XDG launcher.
 
 ### Remaining limitations and acceptance work
 

@@ -25,8 +25,12 @@ wget -qO- https://raw.githubusercontent.com/bobapplemac/nemo-grid-compensator/ma
 ```
 
 These commands execute code retrieved from the project's `main` branch.
-They install for the next graphical login. A successful installation ends
-by printing the installed version. A failed initial download can leave Bash
+From your current X11 Cinnamon session, they initialize a supported profile
+that has no checkpoint or pending transaction, then start the supervised
+watcher. They also configure automatic startup at future graphical logins.
+There is no separate `systemctl enable` step: the XDG autostart entry creates
+the session-scoped transient service. A successful installation prints the
+installed version and explains its startup action. A failed initial download can leave Bash
 with empty input, so a pipeline's exit status alone is not proof of success.
 The inspect-first method below makes the download and execution separate.
 
@@ -34,11 +38,13 @@ The archive downloader prefers curl when available, otherwise wget. An HTTP
 or transport failure aborts installation; it does not install a partial
 download. GitHub's unauthenticated API limits can also cause a download to fail.
 
-### Selecting a revision and starting immediately
+### Selecting a revision and controlling startup
 
 The remote default is `main`. Use `--ref` for an existing branch, tag, or
-commit, and `--start` to install/upgrade and start in the current X11 Cinnamon
-login:
+commit. Startup is automatic when `XDG_SESSION_TYPE=x11`, `DISPLAY`, and
+`XDG_SESSION_ID` identify the current graphical session. Without those
+variables (for example over SSH), installation succeeds and defers startup
+to the next login. `--start` requires that session environment explicitly:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bobapplemac/nemo-grid-compensator/main/install.sh | bash -s -- --ref main --start
@@ -46,6 +52,13 @@ curl -fsSL https://raw.githubusercontent.com/bobapplemac/nemo-grid-compensator/m
 
 ```bash
 wget -qO- https://raw.githubusercontent.com/bobapplemac/nemo-grid-compensator/main/install.sh | bash -s -- --ref main --start
+```
+
+Use `--no-start` for installation only, without immediate initialization or
+service startup:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bobapplemac/nemo-grid-compensator/main/install.sh | bash -s -- --no-start
 ```
 
 Replace the argument after `--ref` to select a different revision. Branch names
@@ -79,7 +92,7 @@ For wget, replace the curl line with:
 wget -qO "$work/install.sh" https://raw.githubusercontent.com/bobapplemac/nemo-grid-compensator/main/install.sh
 ```
 
-You can pass `--ref` and `--start` to `bash "$work/install.sh"` as above.
+You can pass `--ref`, `--start`, or `--no-start` to `bash "$work/install.sh"` as above.
 Inspecting the bootstrap does not review the application or the installer
 inside a subsequently downloaded archive. For a complete source review,
 download GitHub's source archive for a chosen revision, inspect its contents,
@@ -91,8 +104,8 @@ From a complete repository checkout or extracted GitHub source archive:
 
 ```sh
 ./install.sh
-# Or start immediately in the current graphical login:
-./install.sh --start
+# Or install for the next login without starting now:
+./install.sh --no-start
 ```
 
 Local installation uses the adjacent application, startup files, and
@@ -130,10 +143,19 @@ Rerunning the same installation command refreshes managed files atomically
 per file. It preserves Nemo configuration, icon positions, saved utility
 state, and pending recovery journals. As before, managed autostart and
 launcher files are refreshed; see [custom launcher configuration](cli.md#persisting-custom-geometry)
-for upgrade considerations. `--start` restarts an active service when the
+for upgrade considerations. Immediate startup restarts an active service when the
 application or supported launcher changes, retaining the existing recovery
-and session-supervision path. Without `--start`, the running watcher is left
-to the existing session lifecycle.
+and session-supervision path. An unchanged active service is left running.
+With `--no-start` or a deferred non-graphical installation, the running
+watcher is left to the existing session lifecycle.
+
+Before launching a stopped service, the installer invokes the existing
+`--init` mode only when there is no saved checkpoint or pending recovery
+journal. Supported profiles are configured with Auto-arrange off, Align to
+grid on, and Normal icon size, with their logical icon arrangement retained.
+Existing checkpoints and pending journals are left to the normal supervised
+startup/recovery path. Initialization errors stop immediate startup and print
+the application's diagnostic; they do not force an unsupported layout.
 
 Every installation of this installer also saves an executable uninstaller:
 

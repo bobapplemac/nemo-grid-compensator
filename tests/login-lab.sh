@@ -11,9 +11,32 @@ export XDG_STATE_HOME="$PWD/state" XDG_CACHE_HOME="$PWD/cache" XDG_CONFIG_DIRS="
 export XDG_CURRENT_DESKTOP=X-Cinnamon XDG_SESSION_DESKTOP=cinnamon DESKTOP_SESSION=cinnamon
 export NO_AT_BRIDGE=1 XAUTHORITY=/dev/null LD_LIBRARY_PATH="$stage/test-tools/usr/lib/x86_64-linux-gnu"
 printf 'XDG_DESKTOP_DIR="%s/Desktop"\n' "$PWD" >config/user-dirs.dirs
-"$stage/install.sh"
-"$stage/install.sh"
-sed -i 's/--unit=nemo-grid-compensator /--unit=nemo-grid-compensator-login-test /' "$HOME/.local/libexec/nemo-grid-compensator-session"
+if [ "${INSTALL_DURING_SESSION:-0}" = 1 ]; then
+    # A private source copy gives the default-start test its own unit name,
+    # including when installation refreshes the launcher. Never touch the
+    # installed watcher belonging to the normal login.
+    mkdir -p source/startup source/test-bin
+    cp "$stage/install.sh" "$stage/uninstall.sh" "$stage/nemo-grid-compensator" source/
+    cp "$stage/startup/nemo-grid-compensator.desktop" source/startup/
+    sed 's/--unit=nemo-grid-compensator /--unit=nemo-grid-compensator-login-test /' \
+        "$stage/startup/nemo-grid-compensator-session" >source/startup/nemo-grid-compensator-session
+    # Match the installer's status/stop probes to the private launcher's unit.
+    cat >source/test-bin/systemctl <<'SH'
+#!/bin/bash
+args=()
+for arg do
+    [ "$arg" != nemo-grid-compensator.service ] || arg=nemo-grid-compensator-login-test.service
+    args+=("$arg")
+done
+exec /usr/bin/systemctl "${args[@]}"
+SH
+    chmod 755 source/test-bin/systemctl
+    export INSTALL_SOURCE="$PWD/source"
+else
+    "$stage/install.sh" --no-start
+    "$stage/install.sh" --no-start
+    sed -i 's/--unit=nemo-grid-compensator /--unit=nemo-grid-compensator-login-test /' "$HOME/.local/libexec/nemo-grid-compensator-session"
+fi
 server="$stage/test-tools/usr/bin/Xvfb"
 "$server" -displayfd 3 -screen 0 1920x1080x24 -nolisten tcp -ac 3>display-number >xvfb.log 2>&1 &
 xvfb=$!

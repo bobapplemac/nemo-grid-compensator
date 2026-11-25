@@ -43,6 +43,8 @@ class InstallTests(unittest.TestCase):
                         TMPDIR=str(self.temp), XDG_CONFIG_HOME=str(self.home / "config"),
                         XDG_STATE_HOME=str(self.home / "state"))
         self.env.pop("NEMO_GRID_COMPENSATOR_LOCAL", None)
+        for key in ("DISPLAY", "XDG_SESSION_TYPE", "XDG_SESSION_ID"):
+            self.env.pop(key, None)
         self.requests = []
         self.status = 200
         self.archive = self.make_archive()
@@ -222,28 +224,90 @@ sys.exit(subprocess.call([{actual!r}, *args]))
         for path, expected in saved.items():
             self.assertEqual(path.read_bytes(), expected)
 
-    def test_start_delegates_to_existing_supervision_path(self):
-        self.downloader("curl")
-        # Exercise --start without contacting the live user manager or display.
+    def start_fixture(self, active=False):
+        # Exercise startup without contacting the live user manager or display.
         systemctl = self.bin / "systemctl"
         systemctl.unlink()
         systemctl.write_text('''#!/bin/sh
 printf '%s\\n' "$*" >> "$HOME/systemctl.calls"
 case "$*" in
     '--user show-environment') exit 0 ;;
-    '--user is-active --quiet nemo-grid-compensator.service') [ ! -f "$HOME/stopped" ] ;;
-    '--user stop nemo-grid-compensator.service') : > "$HOME/stopped" ;;
+    '--user is-active --quiet nemo-grid-compensator.service') [ -f "$HOME/active" ] ;;
+    '--user stop nemo-grid-compensator.service') rm -f "$HOME/active" ;;
     *) exit 2 ;;
 esac
 ''')
         systemctl.chmod(0o755)
-        self.archive = self.make_archive({"startup/nemo-grid-compensator-session":
-                                          b'#!/bin/sh\nprintf "started\\n" > "$HOME/started"\n'})
-        env = dict(self.env, XDG_SESSION_TYPE="x11", DISPLAY=":fixture", XDG_SESSION_ID="fixture")
+        if active:
+            (self.home / "active").touch()
+        app = b'''#!/usr/bin/python3
+import os, sys
+from pathlib import Path
+home = Path.home()
+if "--init" in sys.argv:
+    with (home / "actions").open("a") as stream:
+        stream.write("initialize\\n")
+    state = Path(os.environ["XDG_STATE_HOME"]) / "nemo-grid-compensator"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "grid.json").write_text("initialized fixture")
+else:
+    print("nemo-grid-compensator 0.1.0rc2")
+'''
+        launcher = b'#!/bin/sh\nprintf "launch\\n" >> "$HOME/actions"\n: > "$HOME/active"\n'
+        self.archive = self.make_archive({"startup/nemo-grid-compensator-session": launcher,
+                                          "nemo-grid-compensator": app})
+        return dict(self.env, XDG_SESSION_TYPE="x11", DISPLAY=":fixture", XDG_SESSION_ID="fixture")
+
+    def test_start_delegates_to_existing_supervision_path(self):
+        self.downloader("curl")
+        env = self.start_fixture(active=True)
         self.successful(self.run_install("--ref", "fixture", "--start", env=env))
-        self.assertEqual((self.home / "started").read_text(), "started\n")
+        self.assertEqual((self.home / "actions").read_text(), "initialize\nlaunch\n")
         calls = (self.home / "systemctl.calls").read_text().splitlines()
         self.assertEqual(calls.count("--user stop nemo-grid-compensator.service"), 1)
+
+    def test_default_graphical_install_initializes_and_starts_once(self):
+        self.downloader("curl")
+        env = self.start_fixture()
+        self.successful(self.run_install(env=env))
+        self.assertEqual((self.home / "actions").read_text(), "initialize\nlaunch\n")
+        self.successful(self.run_install(env=env))
+        self.assertEqual((self.home / "actions").read_text(), "initialize\nlaunch\n")
+
+    def test_no_start_overrides_graphical_default_through_bootstrap(self):
+        self.downloader("curl")
+        env = self.start_fixture()
+        result = self.run_install("--no-start", env=env)
+        self.successful(result)
+        self.assertFalse((self.home / "actions").exists())
+        self.assertFalse((self.home / "systemctl.calls").exists())
+        self.assertIn(b"next Cinnamon login", result.stdout)
+
+    def test_graphical_upgrade_preserves_checkpoint_and_pending_journal(self):
+        self.downloader("curl")
+        env = self.start_fixture(active=True)
+        state = self.home / "state/nemo-grid-compensator"
+        state.mkdir(parents=True)
+        for name in ("grid.json", "transaction.json"):
+            (state / name).write_text("retain existing recovery state")
+        self.successful(self.run_install(env=env))
+        self.assertEqual((self.home / "actions").read_text(), "launch\n")
+        for name in ("grid.json", "transaction.json"):
+            self.assertEqual((state / name).read_text(), "retain existing recovery state")
+
+    def test_explicit_start_requires_graphical_session(self):
+        self.downloader("curl")
+        result = self.run_install("--start")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"X11 Cinnamon login", result.stderr)
+        self.assertFalse((self.home / ".local").exists())
+
+    def test_nongraphical_default_defers_start(self):
+        self.downloader("curl")
+        result = self.run_install()
+        self.successful(result)
+        self.assertIn(b"next Cinnamon login", result.stdout)
+        self.assert_installed()
 
     def test_rejects_invalid_archives_before_executing_installer(self):
         self.downloader("curl")

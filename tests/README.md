@@ -73,6 +73,14 @@ sudo systemd-run --unit=nemo-grid-login-validation --wait --pipe --collect \
   "$PWD/tests/login-lab.sh"
 ```
 
+To test installing into an already running isolated Cinnamon session, repeat
+the command with `--setenv=INSTALL_DURING_SESSION=1` before the script path.
+That mode checks default initialization and immediate supervision, repeat
+installation without restarting the watcher or changing settled metadata,
+logout, and offline removal. A private source copy and a test-only systemctl
+shim keep both launch and status probes on the isolated test unit. The normal
+mode uses `--no-start` while preparing files before graphical login.
+
 A separate real login should remain active for the shared user-manager
 shutdown check. The harness installs twice, exercises startup and logout,
 upgrades the test executable, then uninstalls twice. The optional prior

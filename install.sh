@@ -1,12 +1,13 @@
 #!/bin/sh
 set -eu
 [ "$(id -u)" != 0 ] || { echo "Run this installer as the desktop user." >&2; exit 1; }
-start=no
+start=auto
 ref=main
 remote=no
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --start) start=yes ;;
+        --no-start) start=no ;;
         --ref)
             [ "$#" -ge 2 ] && [ -n "$2" ] || { echo "--ref requires a branch, tag, or commit." >&2; exit 2; }
             ref=$2 remote=yes
@@ -14,7 +15,7 @@ while [ "$#" -gt 0 ]; do
         --ref=*)
             ref=${1#--ref=} remote=yes
             [ -n "$ref" ] || { echo "--ref must not be empty." >&2; exit 2; } ;;
-        *) echo "Usage: $0 [--start] [--ref BRANCH|TAG|COMMIT]" >&2; exit 2 ;;
+        *) echo "Usage: $0 [--start|--no-start] [--ref BRANCH|TAG|COMMIT]" >&2; exit 2 ;;
     esac
     shift
 done
@@ -123,7 +124,10 @@ PY
         sh -n "$download_dir/source/$script"
     done
     set --
-    [ "$start" = no ] || set -- --start
+    case "$start" in
+        yes) set -- --start ;;
+        no) set -- --no-start ;;
+    esac
     NEMO_GRID_COMPENSATOR_LOCAL=1 sh "$download_dir/source/install.sh" "$@"
     exit 0
 fi
@@ -132,6 +136,13 @@ for command in systemd-run systemctl xrandr xwininfo xprop stdbuf gsettings floc
     command -v "$command" >/dev/null || { echo "Missing dependency: $command" >&2; exit 1; }
 done
 /usr/bin/python3 -c 'import gi; gi.require_version("Gtk", "3.0"); from gi.repository import Gio, Gtk; assert Gio.SettingsSchemaSource.get_default().lookup("org.nemo.desktop", True), "Nemo is required"'
+if [ "$start" = auto ]; then
+    if [ "${XDG_SESSION_TYPE:-}" = x11 ] && [ -n "${DISPLAY:-}" ] && [ -n "${XDG_SESSION_ID:-}" ]; then
+        start=yes
+    else
+        start=no
+    fi
+fi
 if [ "$start" = yes ]; then
     [ "${XDG_SESSION_TYPE:-}" = x11 ] && [ -n "${DISPLAY:-}" ] && [ -n "${XDG_SESSION_ID:-}" ] ||
         { echo "Run --start from an X11 Cinnamon login." >&2; exit 1; }
@@ -167,7 +178,22 @@ if [ "$start" = yes ]; then
         systemctl --user stop nemo-grid-compensator.service
     fi
     if ! systemctl --user is-active --quiet nemo-grid-compensator.service; then
+        state="${XDG_STATE_HOME:-$HOME/.local/state}/nemo-grid-compensator"
+        # Configure a first installation before starting supervision. Existing
+        # checkpoints and interrupted transactions keep their normal recovery
+        # path; upgrades do not reset an established profile.
+        if [ ! -e "$state/grid.json" ] && [ ! -L "$state/grid.json" ] &&
+           [ ! -e "$state/transaction.json" ] && [ ! -L "$state/transaction.json" ]; then
+            "$target" --init
+        fi
         "$launcher"
     fi
 fi
 "$target" --version
+if [ "$start" = yes ]; then
+    echo "Service started or already running. Automatic startup is configured for future Cinnamon logins."
+    echo "Check status: systemctl --user status nemo-grid-compensator.service"
+else
+    echo "Installed with automatic startup for the next Cinnamon login."
+    echo "To start now, run ~/.local/libexec/nemo-grid-compensator-session from your X11 Cinnamon session."
+fi
