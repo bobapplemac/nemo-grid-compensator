@@ -31,9 +31,11 @@ fi
 test "$("$HOME/.local/bin/nemo-grid-compensator" --version)" = "nemo-grid-compensator 0.1.0rc2"
 test "$signature" = "$(grep -E '^desktop-grid-adjust=|^nemo-icon-view-' "$XDG_CONFIG_HOME/nemo/desktop-metadata" | sort)"
 echo 'PASS: upgrade preserved saved Nemo layout'
-"$STAGE/uninstall.sh" --files-only --purge-state
+test -x "$HOME/.local/libexec/nemo-grid-compensator-uninstall"
+"$HOME/.local/libexec/nemo-grid-compensator-uninstall" --files-only --purge-state
 "$STAGE/uninstall.sh" --files-only --purge-state
 test ! -e "$HOME/.local/bin/nemo-grid-compensator"
+test ! -e "$HOME/.local/libexec/nemo-grid-compensator-uninstall"
 test ! -e "$XDG_CONFIG_HOME/autostart/nemo-grid-compensator.desktop"
 test ! -e "$XDG_STATE_HOME/nemo-grid-compensator"
 test "$signature" = "$(grep -E '^desktop-grid-adjust=|^nemo-icon-view-' "$XDG_CONFIG_HOME/nemo/desktop-metadata" | sort)"

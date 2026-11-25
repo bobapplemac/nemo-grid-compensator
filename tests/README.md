@@ -14,6 +14,25 @@ real PyGObject/GTK dependencies installed:
 /usr/bin/python3 tests/test_release.py
 ```
 
+Installer regression coverage runs separately as the same non-root user:
+
+```sh
+/usr/bin/python3 tests/test_install.py -v
+```
+
+It requires both curl and wget for coverage of both download paths, in addition
+to the runtime dependencies above. It serves controlled archives on loopback
+HTTP and uses download shims to redirect the installer's fixed GitHub HTTPS
+request to that fixture. No GitHub access, Git executable, live service changes,
+or writes to the user's real home are involved. It covers stdin, standalone,
+local checkout/archive, ref selection and encoding, same-archive inputs,
+reinstallation/state preservation, offline removal, dependency detection,
+`--start` delegation with a simulated supervisor, archive rejection, HTTP
+errors, recursion prevention, and interruption cleanup. Real graphical
+startup/upgrade/removal remains covered by the separate PAM/logind harness.
+See the [installer validation report](../docs/installer-validation.md) for
+the recorded results and the limits of the controlled transport fixture.
+
 As the desktop user, extract Debian's test display server into the checkout.
 This step downloads packages and does not install them.
 

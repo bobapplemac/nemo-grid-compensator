@@ -29,7 +29,8 @@ if [ -e "$state/transaction.json" ] || [ -L "$state/transaction.json" ]; then
     exit 1
 fi
 rm -f -- "$config/autostart/nemo-grid-compensator.desktop" \
-    "$HOME/.local/bin/nemo-grid-compensator" "$HOME/.local/libexec/nemo-grid-compensator-session"
+    "$HOME/.local/bin/nemo-grid-compensator" "$HOME/.local/libexec/nemo-grid-compensator-session" \
+    "$HOME/.local/libexec/nemo-grid-compensator-uninstall"
 if [ "$purge" = yes ] && [ -d "$state" ]; then
     rm -f -- "$state/grid.json" "$state/compositor.json" "$state/interactive-watch.log" "$state/lock"
     rmdir -- "$state"

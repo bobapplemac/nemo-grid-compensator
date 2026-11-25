@@ -28,6 +28,19 @@ is still in progress. This is not the stable v0.1.0 release.
   on an established profile.
 - Document persistent custom launcher settings and upgrade behavior.
 
+### Installer updates after the RC2 bundle
+
+- Support stdin and standalone-script installation from one GitHub repository
+  archive, defaulting to `main`, with optional branch/tag/commit selection via
+  `--ref`. No Git installation or GitHub release is needed.
+- Validate archive structure and required source syntax before invoking the
+  extracted local installer; clean up temporary inputs and prevent recursion.
+- Retain local offline installation, existing runtime dependency checks,
+  startup supervision, and saved layout/recovery state. Install an offline
+  uninstaller under `~/.local/libexec/`.
+- Document curl, wget, and inspect-first installation. These changes do not
+  alter the compensator runtime, optimizer, defaults, or rc2 version.
+
 ### Remaining limitations and acceptance work
 
 The validated baseline uses X11, one monitor, and 100% display scaling.

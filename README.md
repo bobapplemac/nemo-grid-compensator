@@ -61,16 +61,32 @@ included yet.
 
 ## Install and initialize
 
-Clone or download this repository, then run the installer as your Cinnamon
-desktop user, without `sudo`:
+Run either command as your Cinnamon desktop user, without `sudo`. No local
+Git installation or published GitHub release is required:
 
-```sh
-git clone https://github.com/bobapplemac/nemo-grid-compensator.git
-cd nemo-grid-compensator
-./install.sh           # Install for the next graphical login
-# Or install/upgrade and start in the current X11 Cinnamon login:
-./install.sh --start
+```bash
+curl -fsSL https://raw.githubusercontent.com/bobapplemac/nemo-grid-compensator/main/install.sh | bash
 ```
+
+```bash
+wget -qO- https://raw.githubusercontent.com/bobapplemac/nemo-grid-compensator/main/install.sh | bash
+```
+
+These install from `main` for the next graphical login. Rerun the same command
+to reinstall or upgrade. The installer downloads one repository archive and
+uses that revision's local installation logic. To select a branch, tag, or
+commit, or to start in the current X11 Cinnamon login, pass arguments to Bash:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bobapplemac/nemo-grid-compensator/main/install.sh | bash -s -- --ref main --start
+```
+
+Replace `main` after `--ref` with the desired existing ref. For a
+[download-inspect-execute method](docs/installation.md#inspect-before-executing),
+archive validation details, and dependency guidance, see the
+[installation guide](docs/installation.md). A complete local checkout or
+extracted source archive also supports `./install.sh` and `./install.sh --start`
+without network access; adding `--ref` explicitly requests a GitHub download.
 
 The installer checks dependencies; it does not install distribution packages.
 Debian runtime packages are `cinnamon`, `nemo`, `python3`, `python3-gi`,
@@ -125,9 +141,13 @@ custom launcher arguments across upgrades. Use only one startup entry per user.
 Run as the desktop user:
 
 ```sh
-./uninstall.sh
-./uninstall.sh --purge-state  # Also remove the utility's saved state and logs
+~/.local/libexec/nemo-grid-compensator-uninstall
+~/.local/libexec/nemo-grid-compensator-uninstall --purge-state
 ```
+
+The installed uninstaller works offline without the original repository.
+`./uninstall.sh` remains available in a local checkout. `--purge-state` also
+removes the utility's saved state and logs.
 
 Removal stops the managed service and refuses to remove a pending transaction
 journal. It preserves Nemo's last applied spacing, alignment, icon size,
@@ -138,6 +158,7 @@ first and use `--files-only`. The uninstaller can be rerun.
 ## Documentation and tests
 
 - [Command-line reference and configuration](docs/cli.md)
+- [Installation methods and archive validation](docs/installation.md)
 - [Startup, events, transactions, and recovery](docs/architecture.md)
 - [Troubleshooting and limitations](docs/troubleshooting.md)
 - [Validation history and remaining acceptance scenarios](docs/test-results.md)
